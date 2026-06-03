@@ -1,0 +1,92 @@
+# Code Architecture
+
+Overview of the ALF module structure and data flow.
+
+## Source Directories
+
+| Directory | Contents |
+|-----------|----------|
+| `Prog/` | Main QMC code: entry point, control loop, Hamiltonian interface, Green's function, wrapping, updates |
+| `Prog/Hamiltonians/` | Model submodules (one per Hamiltonian) and the template |
+| `Libraries/Modules/` | Reusable Fortran modules: lattices, matrices, HDF5, RNG, Fourier, MPI shared memory |
+| `Libraries/libqrref/` | QR decomposition library |
+| `Analysis/` | Post-processing: `ana.F90`, `ana_hdf5.F90`, covariance analysis, converters, `Max_SAC.F90` |
+| `testsuite/` | Unit and regression tests |
+| `Scripts_and_Parameters_files/` | Job scripts, parameter templates, batch submission utilities |
+| `HDF5/` | Per-compiler HDF5 build scripts |
+| `Documentation/` | LaTeX documentation source |
+
+## Module Hierarchy
+
+```
+main.F90
+├── Hamiltonian_main_mod.F90    ← Hamiltonian interface (ham_base type)
+│   ├── Hamiltonian_*_smod.F90  ← Model submodules (Hubbard, Kondo, tV, …)
+│   ├── Operator_mod.F90        ← Op_V (interaction), Op_T (hopping)
+│   ├── Fields_mod.F90          ← Auxiliary fields (nsigma)
+│   ├── Observables_mod.F90     ← Obser_Vec, Obser_Latt containers
+│   └── WaveFunction_mod.F90    ← Trial wave functions (projective QMC)
+├── control_mod.F90             ← MC control: acceptance tracking, timing
+├── cgr1_mod.F90                ← Green's function from scratch (UDV)
+├── cgr2_2_mod.F90              ← Green's function update (rank-1)
+├── wrapul_mod.F90              ← Wrap Green's function left (forward in τ)
+├── wrapur_mod.F90              ← Wrap Green's function right (backward in τ)
+├── Wrapgr_mod.F90              ← Wrap and recompute Green's function
+├── UDV_WRAP_mod.F90            ← UDV stabilization during wrapping
+├── Langevin_HMC_mod.F90        ← HMC and Langevin update schemes
+├── Global_mod.F90              ← Global moves (space-time and single-τ)
+├── QMC_runtime_var_mod.F90     ← Runtime parameters (from namelists)
+└── Set_random_mod.F90          ← RNG initialization
+```
+
+## Key Data Structures
+
+| Type | Module | Role |
+|------|--------|------|
+| `ham_base` | `Hamiltonian_main_mod` | Abstract base for all Hamiltonians; extended by each model submodule |
+| `Operator` | `Operator_mod` | Represents $e^{V}$ or $e^{T}$ operators with matrix, type, and metadata |
+| `Fields` | `Fields_mod` | Auxiliary Hubbard-Stratonovich field array `f(N_op, Ltrot)` |
+| `Obser_Vec` | `Observables_mod` | Scalar observable: stores one number per bin |
+| `Obser_Latt` | `Observables_mod` | Lattice observable: stores correlation matrix per bin |
+| `Lattice` | `lattices_v3_mod` | Bravais lattice: neighbor lists, distance map, reciprocal vectors |
+| `Unit_cell` | `lattices_v3_mod` | Unit cell: orbital count, positions, coordination vectors |
+| `WaveFunction` | `WaveFunction_mod` | Trial wave function for projective (T=0) QMC |
+
+## Simulation Flow
+
+A single ALF run proceeds as follows:
+
+1. **Initialization**
+   - Read `parameters` (namelists) and `seeds`
+   - Call `Ham_Set`: build lattice, set up operators, initialize fields
+   - Call `Alloc_obs`: allocate observable containers
+   - Compute initial Green's function from scratch (`cgr1`)
+
+2. **Monte Carlo loop** (`NBin` bins × `NSweep` sweeps per bin)
+   - All bins are treated identically — there is no dedicated warmup phase in the simulation. Thermalization bins are discarded later at analysis time via `n_skip`.
+   - For each sweep:
+     - Optionally perform tempering exchanges and global moves
+     - Optionally perform Langevin/HMC updates
+     - **Upward sweep:** traverse time slices $\tau = 0 \to L_\text{trot}-1$
+       - At each slice: propose field updates (sequential / HMC / Langevin), update Green's function via rank-1 updates (`cgr2_2`)
+       - Every `Nwrap` slices: recompute Green's function from scratch for numerical stability (`cgr1` with UDV)
+       - On slices in `[LOBS_ST, LOBS_EN]`: call `Obser` (equal-time measurements)
+     - **Downward sweep:** traverse time slices $\tau = L_\text{trot} \to 1$
+       - Same update and measurement logic as the upward sweep
+     - At end of sweep: compute time-displaced correlations (`TAU_M`) if `Ltau = 1`
+   - At end of bin: average and write observables to disk (`Pr_obs`), save configuration (`confout`)
+
+3. **Finalization**
+   - Write timing and acceptance statistics to `info`
+   - Remove `RUNNING` lock file
+
+## Build System
+
+The build is driven by `configure.sh` + `make`:
+
+1. `source configure.sh <MACHINE> <MODE> [OPTIONS]` — sets `ALF_FC`, `ALF_FLAGS_PROG`, `ALF_LIB`, preprocessor defines
+2. `make lib` — compiles library modules (`Libraries/`)
+3. `make program` — runs `parse_ham.py` to auto-generate Hamiltonian dispatch code, then compiles `Prog/` → `ALF.out`
+4. `make ana` — compiles analysis programs (`Analysis/`)
+
+Dependencies within `Prog/` are auto-generated by `gen_deps.py`.
